@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Angle-Gap Ruler Visualizer (Degrees, with Blue Ticks & Coincident Coords)</title>
+<style>
+  body { background:#000; color:#fff; font-family:Arial, sans-serif; text-align:center; }
+  canvas { background:#000; border:1px solid #444; display:block; margin:10px auto; }
+  .controls { margin:10px auto; display:flex; flex-wrap:wrap; justify-content:center; gap:12px; align-items:center; }
+  .controls label { display:flex; align-items:center; gap:6px; font-size:18px; }
+  input[type="text"], input[type="number"] { background:#111; border:1px solid #333; color:#fff; padding:5px; border-radius:4px; width:120px; font-size:16px; }
+  input[type="range"] { width:220px; }
+  .note { color:#bbb; font-size:16px; margin-top:8px; }
+  .legend { margin-top:6px; font-size:14px; color:#9ad; }
+  code { color:#ffb; }
+</style>
+</head>
+<body>
+<h2>Angle-Gap Ruler Visualizer</h2>
+<div class="controls">
+  <label>Radius r: <input type="text" id="radius" value="5"></label>
+  <label>Zoom divisor: <input type="range" id="zoomSlider" min="0.1" max="1" step="0.01" value="1"><span id="zoomValue">1</span></label>
+  <label>Zoom min: <input type="number" id="zoomMin" value="0.1" step="0.1"></label>
+  <label>Zoom max: <input type="number" id="zoomMax" value="1" step="0.1"></label>
+  <label><input type="checkbox" id="showBlueTicks" checked> Show blue ticks (all integer-axis intercepts)</label>
+  <label><input type="checkbox" id="showDegrees" checked> Label angle gaps (degrees)</label>
+</div>
+<p class="note">Now measuring <b>angle gaps</b> directly (degrees), not arc length. Radius still controls the actual circles, but line lengths are fixed to 45° so totals always equal 45.<br>
+Radius supports <b>sqrt()</b> expressions. Example: <code>sqrt(2)</code> or <code>5/sqrt(3)</code>.</p>
+<div class="legend">
+  <span style="color:yellow">Yellow line = small circle (0°→45°)</span> •
+  <span style="color:#ff6666">Red line = big circle (45°→90°)</span> •
+  <span style="color:#66ccff">Blue ticks = all x- or y-integer intercepts</span> •
+  <span style="color:#0ff">Cyan diamonds = coincident angles (coords shown)</span>
+</div>
+<canvas id="canvas" width="1400" height="560"></canvas>
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const radiusInput   = document.getElementById('radius');
+const zoomSlider    = document.getElementById('zoomSlider');
+const zoomValue     = document.getElementById('zoomValue');
+const zoomMinInput  = document.getElementById('zoomMin');
+const zoomMaxInput  = document.getElementById('zoomMax');
+const showBlueTicks = document.getElementById('showBlueTicks');
+const showDegrees   = document.getElementById('showDegrees');
+
+// ---------- Helpers ----------
+function parseRadius(expr){
+  if(!expr||typeof expr!=='string') return NaN;
+  expr = expr.replace(/√/g,'sqrt');
+  if(!/^([0-9+\-*/().\s]|sqrt)+$/.test(expr)) return NaN;
+  try {
+    const fn = new Function('sqrt','return ('+expr+');');
+    return fn(Math.sqrt);
+  } catch { return NaN; }
+}
+
+function getIntegerXYIntercepts(r,cx,cy,a0,a1){
+  // returns integer (x,y) grid points that lie on the circle within [a0,a1] by angle
+  const out=[],thr=1e-3;
+  for(let x=Math.floor(cx-r-2); x<=Math.ceil(cx+r+2); x++){
+    for(let y=Math.floor(cy-r-2); y<=Math.ceil(cy+r+2); y++){
+      const dx=x-cx, dy=y-cy, dist=Math.hypot(dx,dy);
+      if(Math.abs(dist-r)<thr){
+        let ang = Math.atan2(dy,dx); if(ang<0) ang+=2*Math.PI;
+        if(ang>=a0 && ang<=a1) out.push({x,y,angle:ang});
+      }
+    }
+  }
+  out.sort((a,b)=>a.angle-b.angle);
+  return out;
+}
+
+function getContinuousXInterceptsSmall(r,cx,cy,a0,a1){
+  // integer X vertical grid lines intersecting small circle
+  const out=[];
+  const xMin=cx+r*Math.cos(a1), xMax=cx+r*Math.cos(a0);
+  for(let xi=Math.ceil(Math.min(xMin,xMax)); xi<=Math.floor(Math.max(xMin,xMax)); xi++){
+    const inside=r*r-Math.pow(xi-cx,2); if(inside<0) continue;
+    [cy+Math.sqrt(inside), cy-Math.sqrt(inside)].forEach(y=>{
+      let ang=Math.atan2(y-cy, xi-cx); if(ang<0) ang+=2*Math.PI;
+      if(ang>=a0 && ang<=a1) out.push({x:xi,y,angle:ang});
+    });
+  }
+  out.sort((a,b)=>a.angle-b.angle);
+  return out;
+}
+
+function getContinuousYInterceptsBig(r,cx,cy,a0,a1){
+  // integer Y horizontal grid lines intersecting big circle
+  const out=[];
+  const yMin=cy+r*Math.sin(a0), yMax=cy+r*Math.sin(a1);
+  for(let yi=Math.ceil(Math.min(yMin,yMax)); yi<=Math.floor(Math.max(yMin,yMax)); yi++){
+    const inside=r*r-Math.pow(yi-cy,2); if(inside<0) continue;
+    [cx+Math.sqrt(inside), cx-Math.sqrt(inside)].forEach(x=>{
+      let ang=Math.atan2(yi-cy, x-cx); if(ang<0) ang+=2*Math.PI;
+      if(ang>=a0 && ang<=a1) out.push({x,y:yi,angle:ang});
+    });
+  }
+  out.sort((a,b)=>a.angle-b.angle);
+  return out;
+}
+
+// Compute angle gaps (degrees) including start→first and last→end
+function angleGapsDeg(points, a0, a1){
+  const angles = points.map(p=>p.angle);
+  const gaps = [];
+  // From start boundary to first point
+  if(angles.length===0){
+    gaps.push({from:a0, to:a1, deg:(a1-a0)*180/Math.PI, mid:(a0+a1)/2});
+    return gaps;
+  }
+  gaps.push({from:a0, to:angles[0], deg:(angles[0]-a0)*180/Math.PI, mid:(a0+angles[0])/2});
+  for(let i=0;i<angles.length-1;i++){
+    gaps.push({from:angles[i], to:angles[i+1], deg:(angles[i+1]-angles[i])*180/Math.PI, mid:(angles[i]+angles[i+1])/2});
+  }
+  gaps.push({from:angles[angles.length-1], to:a1, deg:(a1-angles[angles.length-1])*180/Math.PI, mid:(angles[angles.length-1]+a1)/2});
+  return gaps;
+}
+
+// Find coincident angles: relative to start (subtract a0/aB0), compare within tolerance
+function findCoincidentAngles(listA, a0A, listB, a0B, tolDeg=1e-6){
+  const result=[];
+  // Build arrays of relative degrees
+  const A = listA.map(p=>({relDeg:(p.angle - a0A)*180/Math.PI, p}));
+  const B = listB.map(p=>({relDeg:(p.angle - a0B)*180/Math.PI, p}));
+  // Two-pointer merge since both lists sorted by angle already
+  let i=0, j=0;
+  while(i<A.length && j<B.length){
+    const d = A[i].relDeg - B[j].relDeg;
+    if(Math.abs(d) <= tolDeg){
+      result.push({deg:A[i].relDeg, small:A[i].p, big:B[j].p});
+      i++; j++;
+    } else if (d < 0) {
+      i++;
+    } else {
+      j++;
+    }
+  }
+  return result;
+}
+
+// ---------- Drawing ----------
+function draw(){
+  // Read / validate radius
+  const r = parseRadius(radiusInput.value);
+  if(!(r>0)){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#f66';
+    ctx.font='18px monospace';
+    ctx.fillText('Invalid radius expression', 20, 30);
+    return;
+  }
+
+  // Zoom setup
+  const zmin = parseFloat(zoomMinInput.value)||0.1;
+  const zmax = parseFloat(zoomMaxInput.value)||1;
+  zoomSlider.min = zmin; zoomSlider.max = zmax;
+  const zoom = parseFloat(zoomSlider.value)||1;
+  zoomValue.textContent = zoom.toFixed(2);
+
+  // Geometry: small circle center (-0.5, -0.5), radius r/√2, angles [0,45°]; big at (0,0), [45°,90°]
+  const cxS=-0.5, cyS=-0.5, rS=r/Math.SQRT2;
+  const cxB=0,   cyB=0,   rB=r;
+  const aS0=0, aS1=Math.PI/4;      // 0°→45°
+  const aB0=Math.PI/4, aB1=Math.PI/2; // 45°→90°
+
+  // Collect integer grid intercept points (discrete lattice points on circumference)
+  const smallInt = getIntegerXYIntercepts(rS,cxS,cyS,aS0,aS1);
+  const bigInt   = getIntegerXYIntercepts(rB,cxB,cyB,aB0,aB1);
+
+  // Optional blue ticks: all integer-axis intercepts (x-grid for small, y-grid for big)
+  const smallCont = getContinuousXInterceptsSmall(rS,cxS,cyS,aS0,aS1);
+  const bigCont   = getContinuousYInterceptsBig(rB,cxB,cyB,aB0,aB1);
+
+  // Angle gaps (degrees) for small and big
+  const gapsSmall = angleGapsDeg(smallInt, aS0, aS1);
+  const gapsBig   = angleGapsDeg(bigInt,   aB0, aB1);
+
+  // Totals for sanity check (should be ≈45°)
+  const totalSmall = gapsSmall.reduce((s,g)=>s+g.deg,0);
+  const totalBig   = gapsBig.reduce((s,g)=>s+g.deg,0);
+
+  // Find coincident angles (relative angle from each start is equal)
+  const coincident = findCoincidentAngles(smallInt, aS0, bigInt, aB0, 1e-6);
+
+  // ---------- Render horizontal rulers ----------
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // Ruler layout
+  const startX = 80;
+  const ySmall = 180;
+  const yBig   = 400;
+  const degLen = 12;              // px per degree before zoom
+  const lineLenPx = (45 * degLen) / (zoom>0?zoom:1);
+
+  ctx.lineWidth = 5;
+
+  // Small (yellow) ruler
+  ctx.strokeStyle='yellow';
+  ctx.beginPath();
+  ctx.moveTo(startX, ySmall);
+  ctx.lineTo(startX + lineLenPx, ySmall);
+  ctx.stroke();
+
+  // Big (red) ruler
+  ctx.strokeStyle='#ff6666';
+  ctx.beginPath();
+  ctx.moveTo(startX, yBig);
+  ctx.lineTo(startX + lineLenPx, yBig);
+  ctx.stroke();
+
+  // Function to convert an absolute angle to px on its ruler (relative to its a0)
+  const toPxSmall = (ang)=> startX + ((ang - aS0) * 180/Math.PI) * (degLen/zoom);
+  const toPxBig   = (ang)=> startX + ((ang - aB0) * 180/Math.PI) * (degLen/zoom);
+
+  // Draw discrete integer points as solid ticks + labels (coords)
+  ctx.font='16px monospace';
+  // Small (yellow)
+  ctx.fillStyle='yellow';
+  smallInt.forEach(p=>{
+    const x = toPxSmall(p.angle);
+    ctx.fillRect(x-2, ySmall-10, 4, 20);
+    ctx.fillText(`(${p.x},${p.y})`, x+6, ySmall-10);
+  });
+  // Big (red)
+  ctx.fillStyle='#ff6666';
+  bigInt.forEach(p=>{
+    const x = toPxBig(p.angle);
+    ctx.fillRect(x-2, yBig-10, 4, 20);
+    ctx.fillText(`(${p.x},${p.y})`, x+6, yBig-10);
+  });
+
+  // Optional blue ticks for "all intersections in both lines"
+  if(showBlueTicks.checked){
+    ctx.strokeStyle='#66ccff';
+    ctx.lineWidth=3;
+    // Small continuous x-intercepts
+    smallCont.forEach(p=>{
+      const x = toPxSmall(p.angle);
+      ctx.beginPath();
+      ctx.moveTo(x, ySmall-10);
+      ctx.lineTo(x, ySmall+10);
+      ctx.stroke();
+    });
+    // Big continuous y-intercepts
+    bigCont.forEach(p=>{
+      const x = toPxBig(p.angle);
+      ctx.beginPath();
+      ctx.moveTo(x, yBig-10);
+      ctx.lineTo(x, yBig+10);
+      ctx.stroke();
+    });
+  }
+
+  // Angle gap labels (degrees)
+  if(showDegrees.checked){
+    ctx.fillStyle='#ddd';
+    ctx.font='14px monospace';
+    gapsSmall.forEach(g=>{
+      const midPx = startX + (( (g.mid - aS0) * 180/Math.PI) * (degLen/zoom));
+      const txt = (Math.round(g.deg*1e6)/1e6).toString();
+      ctx.fillText(txt, midPx-ctx.measureText(txt).width/2, ySmall-24);
+    });
+    gapsBig.forEach(g=>{
+      const midPx = startX + (( (g.mid - aB0) * 180/Math.PI) * (degLen/zoom));
+      const txt = (Math.round(g.deg*1e6)/1e6).toString();
+      ctx.fillText(txt, midPx-ctx.measureText(txt).width/2, yBig-24);
+    });
+  }
+
+  // Coincident angles: show cyan diamonds on both rulers and print both coordinates
+  ctx.fillStyle='#0ff';
+  ctx.strokeStyle='#0ff';
+  coincident.forEach(c=>{
+    const xS = startX + (c.deg * (degLen/zoom)); // same relative deg → same px on both rulers
+    // Draw diamonds
+    const drawDiamond = (x,y,sz)=>{ ctx.beginPath(); ctx.moveTo(x, y-sz); ctx.lineTo(x+sz, y); ctx.lineTo(x, y+sz); ctx.lineTo(x-sz, y); ctx.closePath(); ctx.stroke(); };
+    drawDiamond(xS, ySmall, 7);
+    drawDiamond(xS, yBig,   7);
+
+    // Coordinates text: show both points
+    ctx.font='15px monospace';
+    const txt = `θ=${c.deg.toFixed(6)}°  S(${c.small.x},${c.small.y}) • B(${c.big.x},${c.big.y})`;
+    ctx.fillText(txt, xS+10, (ySmall+yBig)/2);
+  });
+
+  // Header info
+  ctx.fillStyle='#9ad';
+  ctx.font='18px monospace';
+  ctx.fillText(`r=${r.toFixed(5)} | small sum=${totalSmall.toFixed(6)}° | big sum=${totalBig.toFixed(6)}° (both should be 45°)`, 20, 28);
+}
+
+[ radiusInput, zoomSlider, zoomMinInput, zoomMaxInput, showBlueTicks, showDegrees ].forEach(e=>e.addEventListener('input', draw));
+draw();
+</script>
+</body>
+</html>
